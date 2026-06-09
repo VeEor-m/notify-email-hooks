@@ -1,9 +1,36 @@
 {
   "name": "claude-code-notify-email",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
-  "description": "Stop hook: send email notification when Claude Code finishes a turn",
+  "description": "Claude Code Stop hook: email & IM notifications (Slack, Feishu, DingTalk, WeCom) with token/cost stats when a turn finishes",
+  "bin": {
+    "claude-code-notify-email": "./notify-email.mjs"
+  },
+  "files": [
+    "notify-email.mjs",
+    ".env.example"
+  ],
+  "keywords": [
+    "claude-code",
+    "hook",
+    "notification",
+    "email",
+    "slack",
+    "feishu",
+    "dingtalk",
+    "wecom",
+    "webhook",
+    "smtp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anthropics/claude-code-notify-email.git"
+  },
+  "license": "MIT",
+  "author": "Anthropic",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "dotenv": "^16.4.5",
     "nodemailer": "^6.9.16"

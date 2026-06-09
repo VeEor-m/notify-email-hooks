@@ -1,37 +1,63 @@
+#!/usr/bin/env node
 // Claude Code Stop hook: send an email when a turn finishes.
 // Reads hook input JSON from stdin (session_id, stop_hook_active, reason,
 // transcript_path, cwd, model).
-// Reads SMTP creds from .env in this script's directory.
+// Reads SMTP creds from .env in ~/.claude/hooks/ or this script's directory.
 // Always exits 0 — never blocks Claude, never crashes the hook.
 //
-// Wiring: ~/.claude/settings.json -> hooks.Stop -> node ~/.claude/hooks/notify-email.mjs
+// Wiring: ~/.claude/settings.json -> hooks.Stop -> claude-code-notify-email
+//
+// Usage:
+//   claude-code-notify-email          — run as a hook (reads stdin)
+//   claude-code-notify-email init     — install hook config + .env template
+//   claude-code-notify-email --help   — show help
 
 import { createRequire } from 'node:module';
 import {
   appendFileSync,
   closeSync,
+  copyFileSync,
   existsSync,
+  mkdirSync,
   openSync,
+  readFileSync,
   readSync,
   readdirSync,
   statSync,
+  writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Load .env if present (no-op if missing).
+// ---- paths ----------------------------------------------------------------
+const HOOKS_DIR = join(homedir(), '.claude', 'hooks');
+const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
+const HOOKS_ENV = join(HOOKS_DIR, '.env');
+const LOCAL_ENV = join(__dirname, '.env');
+
+// ---- .env loading (check hooks dir first, then script dir) ----------------
+let dotenv;
 try {
-  const dotenv = require('dotenv');
-  dotenv.config({ path: join(__dirname, '.env'), quiet: true });
+  dotenv = require('dotenv');
 } catch {
   // dotenv missing -> fall through; env vars must be set in the shell.
 }
 
-const nodemailer = require('nodemailer');
+if (dotenv) {
+  const envPath = existsSync(HOOKS_ENV) ? HOOKS_ENV : LOCAL_ENV;
+  if (existsSync(envPath)) {
+    dotenv.config({ path: envPath, quiet: true });
+  }
+}
+
+// Lazy-load nodemailer so a missing dep doesn't crash --help / --version.
+function loadNodemailer() {
+  return require('nodemailer');
+}
 
 // ---- read stdin ----------------------------------------------------------
 async function readStdin() {
@@ -236,7 +262,7 @@ function formatTokenUsage(usage, model) {
 }
 
 // ---- logging -------------------------------------------------------------
-const LOG_PATH = join(__dirname, 'notify-email.log');
+const LOG_PATH = join(HOOKS_DIR, 'notify-email.log');
 function log(level, msg) {
   try {
     appendFileSync(LOG_PATH, `[${new Date().toISOString()}] [${level}] ${msg}\n`);
@@ -571,16 +597,16 @@ async function sendWebhooks(p) {
   }));
 }
 
-// ---- main ----------------------------------------------------------------
-(async () => {
-  let input = {};
-  try {
-    const raw = await readStdin();
-    if (raw.trim()) input = JSON.parse(raw);
-  } catch (e) {
-    process.stderr.write(`[notify-email] could not parse stdin: ${e.message}\n`);
-  }
-
+// ---- main (exported for programmatic use) --------------------------------
+/**
+ * Process a Claude Code Stop hook invocation.
+ *
+ * @param {object} input - Hook payload from Claude Code.
+ *   Fields: session_id, stop_hook_active, reason, transcript_path, cwd, model.
+ * @returns {Promise<{status: 'no_config'|'skipped'|'sent', reason?: string}>}
+ *   Resolves with the outcome. Never throws.
+ */
+export async function notify(input = {}) {
   const {
     SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASS,
     EMAIL_FROM, EMAIL_TO, EMAIL_CC, EMAIL_BCC,
@@ -593,12 +619,12 @@ async function sendWebhooks(p) {
   if (!hasEmailCfg && !hasWebhookCfg) {
     if (!warnedMissing) {
       process.stderr.write(
-        '[notify-email] Neither SMTP nor webhook configured. Copy .env.example to .env and fill in the values.\n',
+        '[notify-email] Neither SMTP nor webhook configured. Run `claude-code-notify-email init` to set up.\n',
       );
       warnedMissing = true;
     }
     log('WARN', 'No notification channels configured, exit');
-    process.exit(0);
+    return { status: 'no_config' };
   }
 
   const sessionId = input.session_id || 'unknown-session';
@@ -643,7 +669,7 @@ async function sendWebhooks(p) {
       : `task took ${formatDuration(durationMs)}, below ${formatDuration(minMs)} threshold`;
     process.stderr.write(`[notify-email] skipped: ${reason}\n`);
     log('WARN', `decision=skip reason="${reason}" threshold_ms=${minMs}`);
-    process.exit(0);
+    return { status: 'skipped', reason };
   }
 
   log('INFO', `decision=send threshold_ms=${minMs} urgent=${isUrgent}`);
@@ -682,6 +708,7 @@ async function sendWebhooks(p) {
   // ---- email ----
   if (hasEmailCfg) {
     try {
+      const nodemailer = loadNodemailer();
       const transporter = nodemailer.createTransport({
         host: SMTP_HOST,
         port: Number(SMTP_PORT) || 465,
@@ -711,5 +738,180 @@ async function sendWebhooks(p) {
   // ---- webhooks (fire-and-forget) ----
   await sendWebhooks(payload);
 
-  process.exit(0);
-})();
+  return { status: 'sent' };
+}
+
+// ---- init command --------------------------------------------------------
+const ENV_TEMPLATE = `# Copy this file to .env and fill in your real values.
+# All vars are required for the email to actually send.
+# If any required var is missing, the hook logs a one-time hint to stderr and exits 0.
+
+# SMTP server (Gmail, Outlook, Fastmail, your own relay, etc.)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=you@gmail.com
+SMTP_PASS=your-app-password
+
+# From / To
+EMAIL_FROM="Claude Code <you@gmail.com>"
+EMAIL_TO=you@gmail.com
+
+# Optional: minimum task duration (ms) to send an email. Default 300000 (5m).
+# Tasks shorter than this are skipped silently (a note goes to stderr).
+# Set to 0 to disable the filter (notify on every turn).
+# NOTIFY_MIN_DURATION_MS=300000
+
+# Optional: IANA timezone for timestamps in the email. Default Asia/Shanghai.
+# NOTIFY_TIMEZONE=Asia/Shanghai
+
+# Optional: truncation limits for user prompt / assistant response in email body.
+# NOTIFY_USER_MAX=1500
+# NOTIFY_ASSISTANT_MAX=800
+
+# Optional: CC / BCC recipients (comma-separated for multiple).
+# EMAIL_CC=
+# EMAIL_BCC=
+
+# Optional: webhook URLs for IM notifications (Slack / Feishu / DingTalk / WeCom).
+# At least one channel (SMTP or webhook) must be configured.
+# SLACK_WEBHOOK_URL=
+# FEISHU_WEBHOOK_URL=
+# DINGTALK_WEBHOOK_URL=
+# WECOM_WEBHOOK_URL=
+`;
+
+async function initCommand() {
+  // 1. Ensure hooks directory exists.
+  if (!existsSync(HOOKS_DIR)) {
+    try {
+      mkdirSync(HOOKS_DIR, { recursive: true });
+      console.log(`Created ${HOOKS_DIR}`);
+    } catch (e) {
+      console.error(`Failed to create ${HOOKS_DIR}: ${e.message}`);
+      process.exit(1);
+    }
+  }
+
+  // 2. Create .env from template (not from .env.example, to avoid shipping
+  //    placeholder credentials that might confuse users).
+  if (!existsSync(HOOKS_ENV)) {
+    try {
+      // Prefer .env.example if it ships alongside the script, fall back to inline template.
+      const envExamplePath = join(__dirname, '.env.example');
+      const template = existsSync(envExamplePath)
+        ? readFileSync(envExamplePath, 'utf8')
+        : ENV_TEMPLATE;
+      writeFileSync(HOOKS_ENV, template);
+      console.log(`Created ${HOOKS_ENV}`);
+      console.log('→ Edit this file with your SMTP / webhook credentials.');
+    } catch (e) {
+      console.error(`Failed to write ${HOOKS_ENV}: ${e.message}`);
+      process.exit(1);
+    }
+  } else {
+    console.log(`.env already exists at ${HOOKS_ENV} — leaving it untouched.`);
+  }
+
+  // 3. Register the hook in settings.json.
+  let settings = {};
+  if (existsSync(SETTINGS_PATH)) {
+    try {
+      settings = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'));
+    } catch (e) {
+      console.error(`Failed to parse ${SETTINGS_PATH}: ${e.message}`);
+      console.error('Please fix or remove the file and try again.');
+      process.exit(1);
+    }
+  }
+
+  if (!settings.hooks) settings.hooks = {};
+  settings.hooks.Stop = 'claude-code-notify-email';
+
+  try {
+    writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n');
+    console.log(`Updated ${SETTINGS_PATH}`);
+  } catch (e) {
+    console.error(`Failed to write ${SETTINGS_PATH}: ${e.message}`);
+    process.exit(1);
+  }
+
+  // 4. Done.
+  console.log('');
+  console.log('✓ Claude Code notify hook is ready!');
+  console.log('');
+  console.log('  Next steps:');
+  console.log(`    1. Edit ${HOOKS_ENV}`);
+  console.log('       Add your SMTP credentials or webhook URLs');
+  console.log('    2. That\'s it — the hook will run after each Claude Code turn');
+  console.log('');
+  console.log('  Test it:');
+  console.log('    echo \'{"session_id":"test-123"}\' | claude-code-notify-email');
+  console.log('');
+  console.log('  Check logs:');
+  console.log(`    tail -f ${join(HOOKS_DIR, 'notify-email.log')}`);
+}
+
+// ---- CLI help ------------------------------------------------------------
+function showHelp() {
+  const pkg = (() => { try { return require('./package.json'); } catch { return {}; } })();
+  const name = pkg.name || 'claude-code-notify-email';
+  const version = pkg.version || '1.0.0';
+
+  console.log(`${name} v${version}`);
+  console.log('');
+  console.log('USAGE');
+  console.log(`  ${name}                  Run as a Claude Code Stop hook (reads JSON from stdin)`);
+  console.log(`  ${name} init             Install hook config + .env template to ~/.claude/`);
+  console.log(`  ${name} --help, -h       Show this help`);
+  console.log(`  ${name} --version, -v    Print version`);
+  console.log('');
+  console.log('QUICK START');
+  console.log(`  npm install -g ${name}`);
+  console.log(`  ${name} init`);
+  console.log(`  # Edit ~/.claude/hooks/.env with your credentials`);
+  console.log('');
+  console.log('ENVIRONMENT VARIABLES');
+  console.log('  See .env.example or run `init` for the full list.');
+  console.log('  At least one channel (SMTP or webhook) must be configured.');
+}
+
+function showVersion() {
+  const pkg = (() => { try { return require('./package.json'); } catch { return {}; } })();
+  console.log(pkg.version || '1.0.0');
+}
+
+// ---- CLI entry point -----------------------------------------------------
+const scriptPath = fileURLToPath(import.meta.url);
+
+// Detect whether we're the entry point (not being imported).
+// When npm creates a bin shim, process.argv[1] is the resolved path to the .mjs file.
+const isMain = process.argv[1] === scriptPath
+  || basename(process.argv[1] || '') === basename(scriptPath);
+
+if (isMain) {
+  const cmd = process.argv[2];
+
+  if (cmd === 'init') {
+    initCommand().then(() => process.exit(0));
+  } else if (cmd === '--help' || cmd === '-h') {
+    showHelp();
+    process.exit(0);
+  } else if (cmd === '--version' || cmd === '-v') {
+    showVersion();
+    process.exit(0);
+  } else {
+    // Hook mode: read stdin and notify.
+    (async () => {
+      let input = {};
+      try {
+        const raw = await readStdin();
+        if (raw.trim()) input = JSON.parse(raw);
+      } catch (e) {
+        process.stderr.write(`[notify-email] could not parse stdin: ${e.message}\n`);
+      }
+      await notify(input);
+      process.exit(0);
+    })();
+  }
+}

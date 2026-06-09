@@ -21,29 +21,49 @@ A **Claude Code Stop hook** that sends notifications via **email** (SMTP) and/or
 ## Installation
 
 ```bash
-# Clone the repo into the Claude Code hooks directory
-git clone <repo-url> ~/.claude/hooks
-
-# Or copy the script and its dependencies manually
-cp notify-email.mjs ~/.claude/hooks/
-cp package.json package-lock.json ~/.claude/hooks/
-
-# Install dependencies
-cd ~/.claude/hooks
-npm install
+npm install -g claude-code-notify-email
+claude-code-notify-email init
 ```
 
-## Wiring
+That's it — `init` creates `~/.claude/hooks/.env` (edit it with your credentials) and registers the Stop hook in `~/.claude/settings.json`.
 
-Register the hook in `~/.claude/settings.json` under `hooks.Stop`:
+### Manual install (no global install)
+
+```bash
+# Clone and install locally
+git clone <repo-url> ~/.claude/hooks
+cd ~/.claude/hooks
+npm install
+
+# Then wire the hook manually in ~/.claude/settings.json:
+#   "hooks": { "Stop": "node ~/.claude/hooks/notify-email.mjs" }
+```
+
+### Using npx (zero-install)
 
 ```json
 {
   "hooks": {
-    "Stop": "node ~/.claude/hooks/notify-email.mjs"
+    "Stop": "npx -y claude-code-notify-email"
   }
 }
 ```
+
+Note: `npx` adds ~1s cold-start overhead per turn. Global install is recommended.
+
+## Wiring
+
+The `init` command writes this to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": "claude-code-notify-email"
+  }
+}
+```
+
+When installed globally, the `claude-code-notify-email` command is on your `PATH`. No absolute paths needed.
 
 ## Configuration
 
@@ -146,14 +166,43 @@ Each platform receives a Markdown-formatted message with the same data fields, i
 - Duration and token/cost stats
 - Session metadata
 
+## CLI
+
+```
+claude-code-notify-email                  # Run as a hook (reads JSON from stdin)
+claude-code-notify-email init             # Install hook config + .env template
+claude-code-notify-email --help           # Show help
+claude-code-notify-email --version        # Print version
+```
+
+## Programmatic use
+
+The `notify()` function is exported and can be called from other scripts:
+
+```js
+import { notify } from 'claude-code-notify-email';
+
+const result = await notify({
+  session_id: 'abc123',
+  reason: 'end_turn',
+  cwd: '/path/to/project',
+  transcript_path: '/path/to/transcript.jsonl',
+});
+
+console.log(result.status);  // 'sent' | 'skipped' | 'no_config'
+```
+
 ## Testing
 
 ```bash
 # Test with a minimal payload (no real notification unless configured)
+echo '{"session_id":"test-123"}' | claude-code-notify-email
+
+# Or during development:
 echo '{"session_id":"test-123"}' | node notify-email.mjs
 ```
 
-The hook logs activity to `notify-email.log` in its own directory. Check it for troubleshooting:
+The hook logs activity to `~/.claude/hooks/notify-email.log`. Check it for troubleshooting:
 
 ```bash
 tail -f ~/.claude/hooks/notify-email.log
