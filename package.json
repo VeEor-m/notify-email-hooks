@@ -1,0 +1,11 @@
+{
+  "name": "claude-code-notify-email",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Stop hook: send email notification when Claude Code finishes a turn",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "nodemailer": "^6.9.16"
+  }
+}
