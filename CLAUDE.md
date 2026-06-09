@@ -30,16 +30,16 @@ No build step, no linter, no test suite — it's a single script.
 
 ## How it works
 
-1. **Reads stdin** — expects JSON with `session_id` and optionally `stop_hook_active` (injected by the Claude Code harness).
+1. **Reads stdin** — expects JSON with `session_id`, `stop_hook_active`, `reason`, `transcript_path`, `cwd` (injected by the Claude Code harness). If stdin is a TTY (no pipe), resolves immediately without waiting.
 2. **Loads `.env`** via `dotenv` — fails silently if `dotenv` is missing (falls through to shell env vars).
-3. **Locates the transcript** — searches `~/.claude/projects/*/` for `{session_id}.jsonl`.
-4. **Parses the last N bytes** of the transcript (tail 200 KB) to extract the last user prompt and last assistant text response, plus their ISO timestamps.
+3. **Locates the transcript** — uses `transcript_path` from hook input if provided, otherwise searches `~/.claude/projects/*/` for `{session_id}.jsonl`.
+4. **Parses the last N bytes** of the transcript (tail 200 KB) to extract the last user prompt, last assistant text response, ISO timestamps, and tool-use counts per turn (e.g. `Read×3, Write×1`).
 5. **Computes duration** — difference between user prompt timestamp and assistant response timestamp.
 6. **Threshold filter** — skips the email if:
    - `stop_hook_active` is `true` (re-invocation, not real work), or
    - Duration is below `NOTIFY_MIN_DURATION_MS` (default 300000 ms = 5 min).
-7. **Builds email** — generates both `text/plain` (monospace-friendly) and `text/html` (table-based, inline styles for Gmail/Outlook) using the extracted prompt/response/meta.
-8. **Sends via SMTP** using `nodemailer`, then **always exits 0** — the hook must never block or crash Claude Code.
+7. **Builds email** — generates both `text/plain` (monospace-friendly) and `text/html` (table-based, inline styles for Gmail/Outlook). Includes stop reason, tool-use summary, and truncated prompt/response/meta.
+8. **Sends via SMTP** using `nodemailer` (with optional CC/BCC), then **always exits 0** — the hook must never block or crash Claude Code.
 
 ## Configuration (.env)
 
@@ -52,13 +52,19 @@ No build step, no linter, no test suite — it's a single script.
 | `SMTP_PASS` | Yes | — | SMTP auth password |
 | `EMAIL_FROM` | Yes | — | `From:` address |
 | `EMAIL_TO` | Yes | — | `To:` address |
-| `NOTIFY_MIN_DURATION_MS` | No | `300000` | Minimum task duration in ms to trigger a notification. Set to `0` to notify on every turn. |
+| `EMAIL_CC` | No | — | `Cc:` address (comma-separated for multiple) |
+| `EMAIL_BCC` | No | — | `Bcc:` address (comma-separated for multiple) |
+| `NOTIFY_MIN_DURATION_MS` | No | `300000` | Minimum task duration in ms to trigger a notification. Set to `0` to notify on every turn. Ignored for `error`/`interrupted` reasons — those always send. |
+| `NOTIFY_TIMEZONE` | No | `Asia/Shanghai` | IANA timezone for email timestamps (e.g. `America/New_York`, `Europe/London`, `UTC`) |
+| `NOTIFY_USER_MAX` | No | `1500` | Max chars of user prompt in email body |
+| `NOTIFY_ASSISTANT_MAX` | No | `800` | Max chars of assistant response in email body |
 
 ## Key design decisions
 
 - **Always exits 0** — the hook must never fail the Claude Code session. All errors are logged to stderr and to `notify-email.log`.
 - **Transcript tail-read** — only reads the last 200 KB of the `.jsonl` transcript file. This keeps the hook fast even for long sessions.
-- **Content truncation** — user prompts capped at 1500 chars, assistant responses at 800 chars, to keep emails concise.
-- **Timezone is hardcoded** — `cstNow()` uses `Asia/Shanghai` (UTC+8). Edit that one line if a different timezone is needed.
+- **Content truncation** — user prompts capped at 1500 chars, assistant responses at 800 chars (configurable via `NOTIFY_USER_MAX` / `NOTIFY_ASSISTANT_MAX`).
+- **Urgent notifications** — `error` and `interrupted` reasons bypass the duration threshold and always send immediately.
+- **Timezone configurable** — default `Asia/Shanghai` (UTC+8), override with `NOTIFY_TIMEZONE`.
 - **Logging** — append-only diagnostic log at `notify-email.log` next to the script. Captures session ID, transcript location, duration, and skip/send decisions.
 - **HTML safety** — user and assistant content is HTML-escaped before interpolation to prevent broken markup or injection.

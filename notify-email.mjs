@@ -1,5 +1,6 @@
 // Claude Code Stop hook: send an email when a turn finishes.
-// Reads hook input JSON from stdin (session_id, stop_hook_active).
+// Reads hook input JSON from stdin (session_id, stop_hook_active, reason,
+// transcript_path, cwd).
 // Reads SMTP creds from .env in this script's directory.
 // Always exits 0 — never blocks Claude, never crashes the hook.
 //
@@ -36,11 +37,12 @@ const nodemailer = require('nodemailer');
 async function readStdin() {
   return new Promise((resolve) => {
     let data = '';
+    // If stdin is a TTY (interactive terminal, no pipe), no hook input is
+    // coming — resolve immediately without waiting for a timeout.
+    if (process.stdin.isTTY) return resolve(data);
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (c) => (data += c));
     process.stdin.on('end', () => resolve(data));
-    // If stdin is empty / closed without data, resolve to '' after a tick.
-    setTimeout(() => resolve(data), 200);
   });
 }
 
@@ -83,12 +85,33 @@ function extractText(content) {
   return null;
 }
 
-// Scan the tail of the transcript for the last user prompt and last
-// assistant text response, with their ISO timestamps. Skips user entries
-// that are only tool_result (no text block). Never throws — always
-// returns {user: {text, ts}, assistant: {text, ts}} (text/ts possibly null).
+// Count tool_use blocks in a message.content, accumulating into `counts`.
+function countTools(content, counts) {
+  if (typeof content === 'string') return;
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (block && block.type === 'tool_use' && typeof block.name === 'string') {
+      counts[block.name] = (counts[block.name] || 0) + 1;
+    }
+  }
+}
+
+// Scan the tail of the transcript for the last user prompt, last assistant
+// text response, and tool-call statistics from the same turn.
+//
+// State machine (scanning backwards):
+//   LOOKING_FOR_ASSISTANT -> found assistant with text -> COUNTING_TOOLS
+//   COUNTING_TOOLS: count tool_use in any assistant message; stop on
+//                    first user message that has text.
+//
+// Skips user entries that are only tool_result (no text block).
+// Never throws — always returns {user, assistant, toolUseCounts}.
 function readLastMessages(transcriptPath) {
-  const empty = { user: { text: null, ts: null }, assistant: { text: null, ts: null } };
+  const empty = {
+    user: { text: null, ts: null },
+    assistant: { text: null, ts: null },
+    toolUseCounts: {},
+  };
   if (!transcriptPath) return empty;
   try {
     const stat = statSync(transcriptPath);
@@ -103,32 +126,50 @@ function readLastMessages(transcriptPath) {
       try { closeSync(fd); } catch {}
     }
     const lines = buf.toString('utf8').split('\n').filter((l) => l.trim());
+
     let userText = null;
     let userTs = null;
     let assistantText = null;
     let assistantTs = null;
+    const toolUseCounts = {};
+    let phase = 'looking'; // 'looking' | 'counting'
+
     for (let i = lines.length - 1; i >= 0; i--) {
       let msg;
       try { msg = JSON.parse(lines[i]); } catch { continue; }
       const role = msg.type || msg.message?.role;
-      if (!userText && role === 'user') {
-        const t = extractText(msg.message?.content);
-        if (t) {
-          userText = t;
-          userTs = typeof msg.timestamp === 'string' ? msg.timestamp : null;
+
+      if (phase === 'looking') {
+        if (role === 'assistant') {
+          const t = extractText(msg.message?.content);
+          if (t) {
+            assistantText = t;
+            assistantTs = typeof msg.timestamp === 'string' ? msg.timestamp : null;
+            phase = 'counting';
+          }
+          // Count tools even in the final assistant message (it may have
+          // tool_use blocks alongside the text response).
+          countTools(msg.message?.content, toolUseCounts);
         }
-      } else if (!assistantText && role === 'assistant') {
-        const t = extractText(msg.message?.content);
-        if (t) {
-          assistantText = t;
-          assistantTs = typeof msg.timestamp === 'string' ? msg.timestamp : null;
+      } else if (phase === 'counting') {
+        if (role === 'assistant') {
+          countTools(msg.message?.content, toolUseCounts);
+        } else if (role === 'user') {
+          const t = extractText(msg.message?.content);
+          if (t) {
+            userText = t;
+            userTs = typeof msg.timestamp === 'string' ? msg.timestamp : null;
+            break;
+          }
+          // tool_result user messages have no text — skip them
         }
       }
-      if (userText && assistantText) break;
     }
+
     return {
       user: { text: userText, ts: userTs },
       assistant: { text: assistantText, ts: assistantTs },
+      toolUseCounts,
     };
   } catch (e) {
     process.stderr.write(`[notify-email] transcript read failed: ${e.message}\n`);
@@ -150,13 +191,30 @@ function formatDuration(ms) {
   return rem ? `${m}m ${rem}s` : `${m}m`;
 }
 
-// "Now" formatted in China Standard Time (UTC+8) as "YYYY-MM-DD HH:MM:SS CST".
-// sv-SE gives us the 24h ISO-like date; we append "CST" to make the zone
-// explicit so the reader doesn't have to guess. Hardcoded to Asia/Shanghai
-// per request — edit this one line if it ever needs to change.
-function cstNow() {
-  const s = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
-  return `${s} CST`;
+// "Now" formatted per NOTIFY_TIMEZONE (default Asia/Shanghai, UTC+8).
+// sv-SE gives us the 24h ISO-like date; we append the IANA zone id so
+// the reader doesn't have to guess. Set NOTIFY_TIMEZONE in .env to
+// override (e.g. "America/New_York", "Europe/London", "UTC").
+function tzNow() {
+  const tz = process.env.NOTIFY_TIMEZONE || 'Asia/Shanghai';
+  const s = new Date().toLocaleString('sv-SE', { timeZone: tz });
+  return `${s} ${tz}`;
+}
+
+// Human-readable labels for hook stop reasons.
+const REASON_LABELS = {
+  end_turn: 'Done',
+  interrupted: 'Interrupted',
+  max_turns: 'Max turns',
+  error: 'Error',
+};
+
+// Format tool-use counts into a compact summary string.
+// e.g. "Read×3, Write×1, Bash×2" or null if no tools were used.
+function formatToolSummary(counts) {
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) return null;
+  return entries.map(([name, count]) => `${name}×${count}`).join(', ');
 }
 
 // ---- logging -------------------------------------------------------------
@@ -188,11 +246,6 @@ function escapeHtml(s) {
 }
 
 // ---- email body builders -------------------------------------------------
-// All-in-one data passed to the template builders.
-function buildPayload({ firstLine, lastUser, lastAssistant, durationMs, sessionId, now, projectCwd, transcriptPath, truncatedUser, truncatedAssistant }) {
-  return { firstLine, lastUser, lastAssistant, durationMs, sessionId, now, projectCwd, transcriptPath, truncatedUser, truncatedAssistant };
-}
-
 // Plain-text fallback. Uses ASCII separators + 2-space indent + U+2502
 // for the section bar — renders well in any monospace viewer including
 // Gmail's "view original".
@@ -200,7 +253,7 @@ function buildText(p) {
   const BAR = '─'.repeat(60);
   const lines = [];
   lines.push(BAR);
-  lines.push('  Claude Code  ·  Task complete');
+  lines.push(`  Claude Code  ·  ${p.reasonLabel}`);
   lines.push(BAR);
   lines.push('');
 
@@ -212,6 +265,10 @@ function buildText(p) {
   if (p.lastAssistant) {
     lines.push(`  ▎ DONE · last response${p.truncatedAssistant ? ' (truncated)' : ''}`);
     lines.push('  ' + p.lastAssistant);
+    lines.push('');
+  }
+  if (p.toolSummary) {
+    lines.push(`  ▎ TOOLS · ${p.toolSummary}`);
     lines.push('');
   }
 
@@ -254,6 +311,12 @@ function buildHtml(p) {
       <td style="color:${TEXT};padding:4px 0;vertical-align:top;font-family:${FONT_MONO};font-size:12px;line-height:1.5;word-break:break-all;">${escapeHtml(v)}</td>
     </tr>`;
 
+  const toolSection = p.toolSummary ? `
+    <tr><td style="padding:14px 28px 0 28px;">
+      <div style="font-size:10px;letter-spacing:1.5px;color:${MUTED};text-transform:uppercase;font-weight:600;margin:0 0 8px 0;">Tools</div>
+      <div style="font-size:13px;line-height:1.5;color:${TEXT};background-color:${SUBTLE};border-left:3px solid ${ACCENT};padding:10px 14px;font-family:${FONT_MONO};margin:0;">${escapeHtml(p.toolSummary)}</div>
+    </td></tr>` : '';
+
   return `<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -265,15 +328,17 @@ function buildHtml(p) {
 
       <tr><td style="padding:22px 28px 18px 28px;border-bottom:1px solid ${BORDER};">
         <div style="font-size:11px;letter-spacing:1.5px;color:${MUTED};text-transform:uppercase;font-weight:600;margin:0;">Claude Code</div>
-        <div style="font-size:20px;color:${TEXT};font-weight:600;margin:2px 0 0 0;line-height:1.3;">${escapeHtml(p.firstLine || 'Task complete')}</div>
+        <div style="font-size:20px;color:${TEXT};font-weight:600;margin:2px 0 0 0;line-height:1.3;">${escapeHtml(p.firstLine || p.reasonLabel)}</div>
       </td></tr>
 
       ${p.lastUser ? section('Task · your prompt', p.lastUser) : ''}
       ${p.lastAssistant ? section('Done · last response', p.lastAssistant, p.truncatedAssistant ? '· truncated' : '') : ''}
+      ${toolSection}
 
       <tr><td style="padding:24px 28px 26px 28px;">
         <div style="font-size:10px;letter-spacing:1.5px;color:${MUTED};text-transform:uppercase;font-weight:600;margin:0 0 10px 0;">Meta</div>
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          ${metaRow('Status', p.reasonLabel)}
           ${metaRow('Time', p.now)}
           ${p.durationMs !== null ? metaRow('Duration', formatDuration(p.durationMs)) : ''}
           ${metaRow('Session', p.sessionId)}
@@ -309,6 +374,8 @@ function buildHtml(p) {
     SMTP_PASS,
     EMAIL_FROM,
     EMAIL_TO,
+    EMAIL_CC,
+    EMAIL_BCC,
   } = process.env;
 
   if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !EMAIL_FROM || !EMAIL_TO) {
@@ -324,15 +391,21 @@ function buildHtml(p) {
 
   const sessionId = input.session_id || 'unknown-session';
   const shortId = String(sessionId).slice(0, 8);
-  const now = cstNow();
-  const projectCwd = process.cwd();
-  const transcriptPath = findTranscript(sessionId);
+  const now = tzNow();
+
+  // Prefer hook-provided values (newer Claude Code) with fallbacks.
+  const projectCwd = input.cwd || process.cwd();
+  const transcriptPath = input.transcript_path || findTranscript(sessionId);
+
   const last = readLastMessages(transcriptPath);
   const lastUser = last.user.text;
   const lastAssistant = last.assistant.text;
+  const toolUseCounts = last.toolUseCounts;
+  const toolSummary = formatToolSummary(toolUseCounts);
 
   log('INFO', `session=${shortId}`);
   log('INFO', `transcript=${transcriptPath || 'NOT_FOUND'}`);
+  log('INFO', `reason=${input.reason || 'unknown'}`);
 
   // Duration: time from user's last text prompt to assistant's last text response.
   // Returns null if either timestamp is missing or unparseable.
@@ -345,13 +418,19 @@ function buildHtml(p) {
 
   log('INFO', `user_text_len=${last.user.text?.length ?? 0} assistant_text_len=${last.assistant.text?.length ?? 0}`);
   log('INFO', `user_ts=${last.user.ts || 'null'} assistant_ts=${last.assistant.ts || 'null'} duration_ms=${durationMs ?? 'null'}`);
+  if (toolSummary) log('INFO', `tools=${toolSummary}`);
 
   // Threshold filter: skip short tasks. Default 5m; override with
   // NOTIFY_MIN_DURATION_MS in .env. If duration is unknown, send anyway
-  // (no data → no filter). skip_hook_active also counts as "short" — it's
+  // (no data -> no filter). skip_hook_active also counts as "short" — it's
   // a re-invocation, not real work.
+  //
+  // NOTE: error / interrupted always send immediately regardless of
+  // duration — you want to know about failures right away.
+  //
   // NOTE: `Number(x) || default` is wrong — `0 || default` is `default`.
   // Treat empty/unset as default; accept "0" as a valid value to disable.
+  const isUrgent = input.reason === 'error' || input.reason === 'interrupted';
   let minMs = 300_000;
   const rawMin = process.env.NOTIFY_MIN_DURATION_MS;
   if (rawMin !== undefined && rawMin !== '') {
@@ -359,7 +438,7 @@ function buildHtml(p) {
     if (Number.isFinite(n) && n >= 0) minMs = n;
   }
   const tooShort = input.stop_hook_active === true;
-  const knownButShort = durationMs !== null && durationMs < minMs;
+  const knownButShort = !isUrgent && durationMs !== null && durationMs < minMs;
   if (tooShort || knownButShort) {
     const reason = tooShort
       ? 'stop_hook_active (re-invocation, no real new work)'
@@ -369,21 +448,33 @@ function buildHtml(p) {
     process.exit(0);
   }
 
-  log('INFO', `decision=send threshold_ms=${minMs}`);
+  log('INFO', `decision=send threshold_ms=${minMs} urgent=${isUrgent}`);
 
-  // Subject: include the first line of the task if available, else just session.
+  // Subject: [Claude Code] <reasonLabel> · <first line of task> · <session>
+  const reasonLabel = REASON_LABELS[input.reason] || 'Done';
   const firstLine = (lastUser || '').split('\n')[0].slice(0, 60).trim();
   const subject = firstLine
-    ? `[Claude Code] ${firstLine} - ${shortId}`
-    : `[Claude Code] Task complete - ${shortId}`;
+    ? `[Claude Code] ${reasonLabel} · ${firstLine} · ${shortId}`
+    : `[Claude Code] ${reasonLabel} · ${shortId}`;
 
-  // Apply truncation with explicit flags so templates can show "(truncated)".
-  const USER_MAX = 1500;
-  const ASSISTANT_MAX = 800;
-  const truncatedUser = !!lastUser && lastUser.length > USER_MAX;
-  const truncatedAssistant = !!lastAssistant && lastAssistant.length > ASSISTANT_MAX;
-  const userText = lastUser ? truncate(lastUser, USER_MAX) : null;
-  const assistantText = lastAssistant ? truncate(lastAssistant, ASSISTANT_MAX) : null;
+  // Configurable truncation limits (env vars override defaults).
+  let userMax = 1500;
+  const rawUserMax = process.env.NOTIFY_USER_MAX;
+  if (rawUserMax !== undefined && rawUserMax !== '') {
+    const n = Number(rawUserMax);
+    if (Number.isFinite(n) && n > 0) userMax = n;
+  }
+  let assistantMax = 800;
+  const rawAssistantMax = process.env.NOTIFY_ASSISTANT_MAX;
+  if (rawAssistantMax !== undefined && rawAssistantMax !== '') {
+    const n = Number(rawAssistantMax);
+    if (Number.isFinite(n) && n > 0) assistantMax = n;
+  }
+
+  const truncatedUser = !!lastUser && lastUser.length > userMax;
+  const truncatedAssistant = !!lastAssistant && lastAssistant.length > assistantMax;
+  const userText = lastUser ? truncate(lastUser, userMax) : null;
+  const assistantText = lastAssistant ? truncate(lastAssistant, assistantMax) : null;
 
   const payload = {
     firstLine,
@@ -396,6 +487,8 @@ function buildHtml(p) {
     transcriptPath,
     truncatedUser,
     truncatedAssistant,
+    reasonLabel,
+    toolSummary,
   };
 
   const text = buildText(payload);
@@ -411,13 +504,17 @@ function buildHtml(p) {
       socketTimeout: 20_000,
     });
 
-    await transporter.sendMail({
+    const mailOpts = {
       from: EMAIL_FROM,
       to: EMAIL_TO,
       subject,
       text,
       html,
-    });
+    };
+    if (EMAIL_CC) mailOpts.cc = EMAIL_CC;
+    if (EMAIL_BCC) mailOpts.bcc = EMAIL_BCC;
+
+    await transporter.sendMail(mailOpts);
     log('INFO', `send result=ok subject="${subject}"`);
   } catch (e) {
     // Log but never fail the hook.
