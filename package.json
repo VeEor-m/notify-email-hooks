@@ -1,6 +1,6 @@
 {
   "name": "claude-code-notify-email",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "description": "Claude Code Stop hook: email & IM notifications (Slack, Feishu, DingTalk, WeCom) with token/cost stats when a turn finishes",
   "bin": {
